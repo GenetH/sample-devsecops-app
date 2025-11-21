@@ -1,53 +1,104 @@
-stages:
-  - build
-  - scan
-  - enforce
-  - push
+name: DevSecOps Pipeline
 
-variables:
-  IMAGE_NAME: "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA"
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
 
-# 1) Build Docker Image
-build-image:
-  stage: build
-  tags: [docker]
-  script:
-    - docker build -t $IMAGE_NAME .
-  artifacts:
-    paths:
-      - trivy-report.json
+jobs:
 
-# 2) Vulnerability Scan (Trivy)
-trivy-scan:
-  stage: scan
-  image: aquasec/trivy:latest
-  script:
-    - trivy image --exit-code 1 --severity HIGH,CRITICAL --format json -o trivy-report.json $IMAGE_NAME
-    - trivy image --severity HIGH,CRITICAL $IMAGE_NAME
-  artifacts:
-    when: always
-    paths:
-      - trivy-report.json
-  allow_failure: false
+  # -----------------------------
+  # Stage 1: Build (same as build-image)
+  # -----------------------------
+  build-image:
+    name: Stage 1 — Build Image
+    runs-on: ubuntu-latest
+    outputs:
+      image_sha: ${{ steps.meta.outputs.image_sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
 
-# 3) Policy Enforcement (OPA Conftest)
-opa-policy-check:
-  stage: enforce
-  image: openpolicyagent/conftest:latest
-  script:
-    - conftest test Dockerfile --policy policies/
-  allow_failure: false
+      - name: Build Docker image
+        id: meta
+        run: |
+          IMAGE_NAME=sample-image:${{ github.sha }}
+          echo "IMAGE_NAME=$IMAGE_NAME" >> $GITHUB_ENV
+          echo "image_sha=${{ github.sha }}" >> $GITHUB_OUTPUT
+          docker build -t $IMAGE_NAME .
 
-# 4) Push Image (only if secure & compliant)
-push-image:
-  stage: push
-  script:
-    - echo "Logging in to GitLab registry..."
-    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin $CI_REGISTRY
-    - echo "Pushing secure & compliant image..."
-    - docker push $IMAGE_NAME
-  only:
-    - main
-  needs:
-    - trivy-scan
-    - opa-policy-check
+  # -----------------------------
+  # Stage 2: Scan (same as trivy-scan)
+  # -----------------------------
+  trivy-scan:
+    name: Stage 2 — Trivy Scan
+    needs: build-image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Pull Docker image from previous stage
+        run: docker build -t sample-image:${{ github.sha }} .
+
+      - name: Run Trivy Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: sample-image:${{ github.sha }}
+          exit-code: "1"
+          severity: "HIGH,CRITICAL"
+          format: "json"
+          output: "trivy-report.json"
+
+      - name: Upload Trivy Report
+        uses: actions/upload-artifact@v3
+        with:
+          name: trivy-report
+          path: trivy-report.json
+
+  # -----------------------------
+  # Stage 3: Enforce (same as opa-policy-check)
+  # -----------------------------
+  opa-policy-check:
+    name: Stage 3 — OPA Policy Check
+    needs: trivy-scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Install Conftest
+        run: |
+          wget https://github.com/open-policy-agent/conftest/releases/latest/download/conftest_Linux_x86_64.tar.gz
+          tar xzf conftest_Linux_x86_64.tar.gz
+          sudo mv conftest /usr/local/bin/
+
+      - name: Run OPA Policy Check
+        run: conftest test Dockerfile --policy policies/
+
+  # -----------------------------
+  # Stage 4: Push (same as push-image)
+  # -----------------------------
+  push-image:
+    name: Stage 4 — Push Secure Image
+    needs: opa-policy-check
+    runs-on: ubuntu-latest
+    if: success()
+    steps:
+      - name: Log in to GitHub Container Registry
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+          docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Rebuild Image (required for GitHub)
+        run: |
+          docker build -t sample-image:${{ github.sha }} .
+
+      - name: Tag Image
+        run: |
+          docker tag sample-image:${{ github.sha }} \
+            ghcr.io/${{ github.repository_owner }}/sample-image:${{ github.sha }}
+
+      - name: Push Image
+        run: |
+          docker push ghcr.io/${{ github.repository_owner }}/sample-image:${{ github.sha }}
